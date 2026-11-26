@@ -346,3 +346,23 @@ class PortfolioInvestedPoint(BaseModel):
 
     date: _date
     amount: float
+
+
+class AssetArchiveBatchRequest(BaseModel):
+    asset_ids: list[uuid.UUID] = Field(..., min_length=1)
+    is_archived: bool = True
+
+
+class AssetArchiveBatchResponse(BaseModel):
+    updated_count: int
+
+
+class AssetPurchaseBackfillRequest(BaseModel):
+    purchase_date: Optional[_date] = None
+    purchase_price: Optional[Decimal] = None
+    values: list[AssetValueCreate] = Field(default_factory=list)
+
+
+class AssetPurchaseBackfillResponse(BaseModel):
+    asset: AssetRead
+    values_created: int
