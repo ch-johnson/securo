@@ -2848,7 +2848,9 @@ async def handle_oauth_callback(
             failover_account_ids=failover_account_ids,
         )
         expected_account_ids = {account.id for account, _ in synced_accounts}
-        all_complete = expected_account_ids.issubset(complete_account_ids)
+        all_complete = bool(expected_account_ids) and expected_account_ids.issubset(
+            complete_account_ids
+        )
         now = datetime.now(timezone.utc)
         if all_complete:
             connection.last_sync_at = now
@@ -2989,6 +2991,21 @@ async def _run_first_import(
             else None
         )
         seen_external_ids: set[str] = set()
+        claimed_booked_ids: set[uuid.UUID] = set()
+        matched_incoming_external_ids: set[str] = set()
+        if incoming_external_ids:
+            matched_incoming_external_ids = {
+                ext_id
+                for ext_id in (
+                    await session.execute(
+                        select(Transaction.external_id).where(
+                            Transaction.account_id == account.id,
+                            Transaction.external_id.in_(incoming_external_ids),
+                        )
+                    )
+                ).scalars()
+                if ext_id is not None
+            }
         for txn_data in transactions_data:
             # Providers should return each external transaction once, but an
             # upstream pagination bug can repeat a page.
@@ -3012,6 +3029,7 @@ async def _run_first_import(
             )
             existing_tx = existing.scalars().first()
             if existing_tx is not None:
+                matched_incoming_external_ids.add(txn_data.external_id)
                 if existing_tx.is_ignored:
                     continue
                 if existing_tx.status == "pending" and txn_data.status == "posted":
@@ -3048,8 +3066,10 @@ async def _run_first_import(
             # Pass 2: fuzzy match against manual transactions on existing accounts.
             fuzzy_match = await _fuzzy_match_manual(session, account.id, txn_data)
             if fuzzy_match:
+                matched_incoming_external_ids.add(txn_data.external_id)
                 if fuzzy_match.is_ignored:
                     continue
+                claimed_booked_ids.add(fuzzy_match.id)
                 _merge_sync_metadata(fuzzy_match, txn_data)
                 fuzzy_match.source = "sync"
                 fuzzy_match.is_paid = True
@@ -3072,8 +3092,13 @@ async def _run_first_import(
                 incoming_batch=transactions_data,
                 provider=connection.provider,
                 allow_booked_dedup=account_failover_dedup,
+                claimed_booked_ids=claimed_booked_ids,
+                matched_incoming_external_ids=matched_incoming_external_ids,
             )
             if synced_dup:
+                matched_incoming_external_ids.add(txn_data.external_id)
+                if not _is_stale_pending_twin(synced_dup, txn_data):
+                    claimed_booked_ids.add(synced_dup.id)
                 settles = synced_dup.status == "pending" and txn_data.status == "posted"
                 if settles:
                     manual_description = await read_description_is_manual(
@@ -3706,7 +3731,7 @@ async def _resolve_sync_account(
                 [link.account for link in masked_links if link.account is not None],
                 acc_data,
             )
-        if matched_fallback_acc is None:
+        if matched_fallback_acc is None and connection.provider == "simplefin":
             norm_name = _normalized_account_name(acc_data.name)
             if norm_name:
                 name_links = [
@@ -4449,6 +4474,67 @@ def _eb_purchase_date(raw: dict, booked_on: date) -> Optional[date]:
     return None
 
 
+def _booked_rekey_matches_candidate(
+    candidate: Transaction,
+    txn_data,
+    *,
+    provider: Optional[str],
+) -> bool:
+    """Whether stored booked sync row ``candidate`` matches incoming ``txn_data``
+    for Path 4b booked↔booked re-keying (ignoring external_id)."""
+    if txn_data.status != "posted":
+        return False
+    if candidate.source != "sync" or candidate.status != "posted":
+        return False
+    if candidate.external_id and candidate.external_id.startswith("bill_charge:"):
+        return False
+    if candidate.amount != txn_data.amount or candidate.type != txn_data.type:
+        return False
+    if txn_data.currency is not None and candidate.currency != txn_data.currency:
+        return False
+    raw = txn_data.raw_data if isinstance(txn_data.raw_data, dict) else {}
+    is_eb = provider == "enable_banking"
+    if is_eb:
+        candidate_raw = (
+            candidate.raw_data if isinstance(candidate.raw_data, dict) else {}
+        )
+        incoming_cp = _eb_counterparty(raw)
+        if candidate_raw:
+            candidate_ref = candidate_raw.get("entry_reference")
+            if isinstance(candidate_ref, str):
+                candidate_ref = candidate_ref.strip()
+            if candidate_ref not in (None, "", "0"):
+                return False
+            stored_date = _eb_entry_date(candidate_raw)
+            if candidate.date != txn_data.date and stored_date != txn_data.date:
+                return False
+            candidate_cp = _eb_counterparty(candidate_raw)
+            if (
+                incoming_cp
+                and candidate_cp
+                and token_overlap(candidate_cp, incoming_cp) < 0.9
+            ):
+                return False
+        elif candidate.date != txn_data.date:
+            return False
+    else:
+        if candidate.date != txn_data.date:
+            return False
+        if (
+            txn_data.payee
+            and candidate.payee
+            and token_overlap(candidate.payee, txn_data.payee) < 0.9
+        ):
+            return False
+    return (
+        token_overlap(
+            candidate.original_description or candidate.description,
+            txn_data.description,
+        )
+        >= 0.9
+    )
+
+
 async def _find_booked_rekey_candidates(
     session: AsyncSession,
     account_id: uuid.UUID,
@@ -4456,9 +4542,9 @@ async def _find_booked_rekey_candidates(
     incoming_external_ids: set[str],
     *,
     provider: Optional[str],
+    claimed_ids: Optional[set[uuid.UUID]] = None,
 ) -> list[Transaction]:
     """Find stored posted sync transactions that match ``txn_data`` under another external_id."""
-    raw = txn_data.raw_data if isinstance(txn_data.raw_data, dict) else {}
     is_eb = provider == "enable_banking"
     date_lower = (
         txn_data.date - timedelta(days=1 + _EB_HOLD_SETTLE_DAYS)
@@ -4478,51 +4564,16 @@ async def _find_booked_rekey_candidates(
     )
     if txn_data.currency is not None:
         stmt = stmt.where(Transaction.currency == txn_data.currency)
+    stmt = stmt.order_by(Transaction.created_at, Transaction.id)
     result = await session.execute(stmt)
     booked_matches: list[Transaction] = []
-    incoming_cp = _eb_counterparty(raw) if is_eb else None
     for candidate in result.scalars():
-        if candidate.external_id and candidate.external_id.startswith("bill_charge:"):
+        if claimed_ids and candidate.id in claimed_ids:
             continue
         if candidate.external_id in incoming_external_ids:
             continue
-        if is_eb:
-            candidate_raw = (
-                candidate.raw_data if isinstance(candidate.raw_data, dict) else {}
-            )
-            if candidate_raw:
-                candidate_ref = candidate_raw.get("entry_reference")
-                if isinstance(candidate_ref, str):
-                    candidate_ref = candidate_ref.strip()
-                if candidate_ref not in (None, "", "0"):
-                    continue
-                stored_date = _eb_entry_date(candidate_raw)
-                if candidate.date != txn_data.date and stored_date != txn_data.date:
-                    continue
-                candidate_cp = _eb_counterparty(candidate_raw)
-                if (
-                    incoming_cp
-                    and candidate_cp
-                    and token_overlap(candidate_cp, incoming_cp) < 0.9
-                ):
-                    continue
-            elif candidate.date != txn_data.date:
-                continue
-        else:
-            if candidate.date != txn_data.date:
-                continue
-            if (
-                txn_data.payee
-                and candidate.payee
-                and token_overlap(candidate.payee, txn_data.payee) < 0.9
-            ):
-                continue
-        if (
-            token_overlap(
-                candidate.original_description or candidate.description,
-                txn_data.description,
-            )
-            < 0.9
+        if not _booked_rekey_matches_candidate(
+            candidate, txn_data, provider=provider
         ):
             continue
         booked_matches.append(candidate)
@@ -4568,6 +4619,8 @@ async def _find_synced_duplicate(
     incoming_batch: Sequence[TransactionData] = (),
     provider: Optional[str] = None,
     allow_booked_dedup: bool = False,
+    claimed_booked_ids: Optional[set[uuid.UUID]] = None,
+    matched_incoming_external_ids: Optional[set[str]] = None,
 ) -> Optional[Transaction]:
     """Find an existing row that the incoming `txn_data` is a twin of.
 
@@ -4834,22 +4887,69 @@ async def _find_synced_duplicate(
         (provider == "enable_banking" and live_external_ids is not None)
         or (provider != "enable_banking" and allow_booked_dedup)
     ):
-        # Path 4b: strict unique booked↔booked match when external_id rotates —
-        # for Enable Banking entries lacking `entry_reference` (including holds
-        # settled up to `_EB_HOLD_SETTLE_DAYS` earlier), or for non-EB providers
+        # Path 4b: booked↔booked match when external_id rotates — for Enable
+        # Banking entries lacking `entry_reference` (including holds settled up
+        # to `_EB_HOLD_SETTLE_DAYS` earlier), or for non-EB providers
         # (Pluggy/plugins) during cross-connection failover/takeover where each
         # connection assigns its own transaction IDs.
+        #
+        # Singletons match directly; identical same-day/same-amount/same-merchant
+        # groups reconcile deterministically 1-to-1 across the batch when the
+        # remaining unmatched incoming count equals the remaining unmatched old
+        # candidate count (failing closed on unequal or asymmetric groups).
         booked_matches = await _find_booked_rekey_candidates(
             session,
             account_id,
             txn_data,
             incoming_external_ids,
             provider=provider,
+            claimed_ids=claimed_booked_ids,
         )
-        if len(booked_matches) == 1 and not _eb_exact_twin_in_batch(
-            booked_matches[0], txn_data, incoming_batch
-        ):
-            return booked_matches[0]
+        if booked_matches:
+            seen_batch_ids: set[str] = set()
+            unmatched_batch: list[TransactionData] = []
+            for item in incoming_batch:
+                if item.external_id in seen_batch_ids:
+                    continue
+                seen_batch_ids.add(item.external_id)
+                if (
+                    matched_incoming_external_ids
+                    and item.external_id != txn_data.external_id
+                    and item.external_id in matched_incoming_external_ids
+                ):
+                    continue
+                unmatched_batch.append(item)
+            if txn_data.external_id not in seen_batch_ids:
+                unmatched_batch.append(txn_data)
+
+            incoming_group = [
+                item
+                for item in unmatched_batch
+                if any(
+                    _booked_rekey_matches_candidate(
+                        cand, item, provider=provider
+                    )
+                    for cand in booked_matches
+                )
+            ]
+            has_eb_ref_peer = provider == "enable_banking" and any(
+                isinstance(item.raw_data, dict)
+                and isinstance(item.raw_data.get("entry_reference"), str)
+                and item.raw_data["entry_reference"].strip() not in ("", "0")
+                for item in incoming_group
+            )
+            if (
+                not has_eb_ref_peer
+                and len(incoming_group) == len(booked_matches)
+                and all(
+                    _booked_rekey_matches_candidate(
+                        cand, item, provider=provider
+                    )
+                    for cand in booked_matches
+                    for item in incoming_group
+                )
+            ):
+                return booked_matches[0]
 
     # Path 5: local import history from before the account was connected.
     # Posting lag and statement exports can shift the date or shorten the
@@ -6192,13 +6292,11 @@ async def sync_connection(
                     display_name=reg_inst.name if reg_inst else None,
                     masked_number=acc_data.masked_number,
                     type=acc_data.type,
-                    balance=_provider_to_internal_balance(
-                        connection.provider,
-                        acc_data.type,
-                        _account_balance(acc_data, auto_invested_deducted),
-                        available_credit=acc_data.available_credit,
-                        credit_limit=acc_data.credit_limit if is_cc else None,
-                    ),
+                    # Keep the full reported balance until the main sync commit
+                    # applies `auto_invested_deducted` alongside `_sync_holdings`,
+                    # so a failed transaction fetch never leaves a reduced balance
+                    # committed without its holding.
+                    balance=_new_account_balance(connection.provider, acc_data, {}),
                     currency=acc_data.currency,
                     credit_limit=acc_data.credit_limit if is_cc else None,
                     statement_close_day=acc_data.statement_close_day if is_cc else None,
@@ -6654,6 +6752,21 @@ async def sync_connection(
             expires_holds = (connection.provider == "enable_banking" or vouches_feed) and not partial_feed
             hold_live_ids = live_txn_external_ids[account.id] if claims_holds else None
             account_failover_dedup = promoted or (str(account.id) in failover_dedup_ids)
+            claimed_booked_ids: set[uuid.UUID] = set()
+            matched_incoming_external_ids: set[str] = set()
+            if incoming_txn_external_ids:
+                matched_incoming_external_ids = {
+                    ext_id
+                    for ext_id in (
+                        await session.execute(
+                            select(Transaction.external_id).where(
+                                Transaction.account_id == account.id,
+                                Transaction.external_id.in_(incoming_txn_external_ids),
+                            )
+                        )
+                    ).scalars()
+                    if ext_id is not None
+                }
             for txn_data in transactions_data:
                 await _remember_linked_card(
                     session, account, txn_data.card_masked_number, known_linked_card_numbers
@@ -6675,6 +6788,7 @@ async def sync_connection(
                 # re-inserting, so a stray duplicate is harmless and never grows.
                 existing_tx = existing.scalars().first()
                 if existing_tx:
+                    matched_incoming_external_ids.add(txn_data.external_id)
                     # User-flagged rows are frozen: skip status/bill drift so
                     # a re-sync can't revive a transaction the user hid.
                     if existing_tx.is_ignored:
@@ -6717,8 +6831,10 @@ async def sync_connection(
                 # Pass 2: Fuzzy match against manual transactions
                 fuzzy_match = await _fuzzy_match_manual(session, account.id, txn_data)
                 if fuzzy_match:
+                    matched_incoming_external_ids.add(txn_data.external_id)
                     if fuzzy_match.is_ignored:
                         continue
+                    claimed_booked_ids.add(fuzzy_match.id)
                     _merge_sync_metadata(fuzzy_match, txn_data)
                     fuzzy_match.source = "sync"
                     # The bank just confirmed the row the user typed (#15).
@@ -6741,8 +6857,13 @@ async def sync_connection(
                     incoming_batch=transactions_data,
                     provider=connection.provider,
                     allow_booked_dedup=account_failover_dedup,
+                    claimed_booked_ids=claimed_booked_ids,
+                    matched_incoming_external_ids=matched_incoming_external_ids,
                 )
                 if synced_dup:
+                    matched_incoming_external_ids.add(txn_data.external_id)
+                    if not _is_stale_pending_twin(synced_dup, txn_data):
+                        claimed_booked_ids.add(synced_dup.id)
                     settles = synced_dup.status == "pending" and txn_data.status == "posted"
                     if settles:
                         manual_description = await read_description_is_manual(
@@ -7240,7 +7361,7 @@ async def sync_connection(
         sync_outcome: SyncOutcome
         if not rate_limited_accounts:
             sync_outcome = "refreshed"
-            if not incomplete_fetch_account_ids:
+            if not incomplete_fetch_account_ids and (accounts_data or connection_had_links):
                 connection.last_sync_at = datetime.now(timezone.utc)
             # A successful read ends any scheduler backoff (app.tasks.sync_tasks).
             current_settings = connection.settings or {}

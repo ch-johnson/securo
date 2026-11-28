@@ -3941,3 +3941,955 @@ async def test_reconnect_during_sync_registration_gap_aborts_stale_import(
     assert reloaded_pluggy is not None
     assert reloaded_pluggy.status == "active"
     assert reloaded_pluggy.last_sync_at is None
+
+
+@pytest.mark.asyncio
+async def test_migrated_pluggy_link_rejects_name_only_rebind_while_simplefin_and_mask_or_fp_succeed(
+    session: AsyncSession, test_user: User, test_workspace
+):
+    """Name-only rekeying in fallback_links is strictly limited to SimpleFIN:
+    a migrated Pluggy link with no fingerprint, stable_external_id, or mask
+    must NOT rebind to a distinct incoming Pluggy account sharing name, type,
+    and currency, whereas SimpleFIN name-only rekeying and Pluggy mask or
+    fingerprint rekeying still succeed."""
+    ws_id = test_workspace.id
+    uid = test_user.id
+
+    # 1. Migrated Pluggy link with no fingerprint / stable_external_id / mask
+    pluggy_conn = BankConnection(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        provider="pluggy",
+        external_id="pluggy-migrated-name-only",
+        institution_name="Itaú",
+        credentials={"item_id": "pluggy-migrated-name-only", "connector_id": "201"},
+        status="active",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(pluggy_conn)
+    await session.flush()
+
+    pluggy_nomask_acc = Account(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        connection_id=pluggy_conn.id,
+        external_id="pluggy-old-nomask",
+        masked_number=None,
+        account_fingerprint=None,
+        stable_external_id=None,
+        name="Checking",
+        type="checking",
+        balance=Decimal("1000.00"),
+        currency="BRL",
+    )
+    pluggy_masked_acc = Account(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        connection_id=pluggy_conn.id,
+        external_id="pluggy-old-masked",
+        masked_number="6789",
+        account_fingerprint=None,
+        stable_external_id=None,
+        name="Masked Checking",
+        type="checking",
+        balance=Decimal("500.00"),
+        currency="BRL",
+    )
+    pluggy_fp = hash_account_identifier(
+        "pluggy", "1234-99887", institution="connector:201"
+    )
+    assert pluggy_fp is not None
+    pluggy_fp_acc = Account(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        connection_id=pluggy_conn.id,
+        external_id="pluggy-old-fp",
+        masked_number="9887",
+        account_fingerprint=pluggy_fp,
+        stable_external_id=None,
+        name="FP Checking",
+        type="checking",
+        balance=Decimal("300.00"),
+        currency="BRL",
+    )
+    session.add_all([pluggy_nomask_acc, pluggy_masked_acc, pluggy_fp_acc])
+    await session.flush()
+    session.add_all(
+        [
+            AccountConnectionLink(
+                workspace_id=ws_id,
+                account_id=pluggy_nomask_acc.id,
+                connection_id=pluggy_conn.id,
+                external_id="pluggy-old-nomask",
+                is_primary_feed=True,
+                status="active",
+            ),
+            AccountConnectionLink(
+                workspace_id=ws_id,
+                account_id=pluggy_masked_acc.id,
+                connection_id=pluggy_conn.id,
+                external_id="pluggy-old-masked",
+                is_primary_feed=True,
+                status="active",
+            ),
+            AccountConnectionLink(
+                workspace_id=ws_id,
+                account_id=pluggy_fp_acc.id,
+                connection_id=pluggy_conn.id,
+                external_id="pluggy-old-fp",
+                account_fingerprint=pluggy_fp,
+                is_primary_feed=True,
+                status="active",
+            ),
+        ]
+    )
+
+    # 2. SimpleFIN link with no fingerprint / stable_external_id / mask
+    sf_conn = BankConnection(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        provider="simplefin",
+        external_id="sf-rekey-name-only",
+        institution_name="SimpleFIN",
+        credentials={"access_url": "https://example.invalid"},
+        status="active",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(sf_conn)
+    await session.flush()
+    sf_acc = Account(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        connection_id=sf_conn.id,
+        external_id="sf-old-id",
+        masked_number=None,
+        name="Checking",
+        type="checking",
+        balance=Decimal("250.00"),
+        currency="USD",
+    )
+    session.add(sf_acc)
+    await session.flush()
+    session.add(
+        AccountConnectionLink(
+            workspace_id=ws_id,
+            account_id=sf_acc.id,
+            connection_id=sf_conn.id,
+            external_id="sf-old-id",
+            is_primary_feed=True,
+            status="active",
+        )
+    )
+    await session.commit()
+
+    # Migrated Pluggy link with no mask/fp/stable_id must NOT rebind by name alone.
+    res_acc, res_link, status = await connection_service._resolve_sync_account(
+        session,
+        pluggy_conn,
+        AccountData(
+            external_id="pluggy-distinct-new-id",
+            name="Checking",
+            type="checking",
+            balance=Decimal("10.00"),
+            currency="BRL",
+        ),
+        None,
+        incoming_external_ids={"pluggy-distinct-new-id"},
+        incoming_institution_external_ids=frozenset(),
+        claimed_account_ids=set(),
+    )
+    assert status == "new"
+    assert res_acc is None and res_link is None
+    await session.refresh(pluggy_nomask_acc)
+    assert pluggy_nomask_acc.external_id == "pluggy-old-nomask"
+
+    # Pluggy migrated link WITH matching masked_number still rebinds cleanly.
+    res_masked, link_masked, status_masked = await connection_service._resolve_sync_account(
+        session,
+        pluggy_conn,
+        AccountData(
+            external_id="pluggy-rotated-masked",
+            masked_number="6789",
+            name="Masked Checking",
+            type="checking",
+            balance=Decimal("500.00"),
+            currency="BRL",
+        ),
+        None,
+        incoming_external_ids={"pluggy-rotated-masked"},
+        incoming_institution_external_ids=frozenset(),
+        claimed_account_ids=set(),
+    )
+    assert status_masked == "primary"
+    assert res_masked is not None and res_masked.id == pluggy_masked_acc.id
+    assert link_masked is not None and link_masked.external_id == "pluggy-rotated-masked"
+    assert pluggy_masked_acc.external_id == "pluggy-rotated-masked"
+
+    # Pluggy link WITH matching account_fingerprint still rebinds cleanly.
+    res_fp, link_fp, status_fp = await connection_service._resolve_sync_account(
+        session,
+        pluggy_conn,
+        AccountData(
+            external_id="pluggy-rotated-fp",
+            account_fingerprint=pluggy_fp,
+            masked_number="9887",
+            name="FP Checking",
+            type="checking",
+            balance=Decimal("300.00"),
+            currency="BRL",
+        ),
+        None,
+        incoming_external_ids={"pluggy-rotated-fp"},
+        incoming_institution_external_ids=frozenset(),
+        claimed_account_ids=set(),
+    )
+    assert status_fp == "primary"
+    assert res_fp is not None and res_fp.id == pluggy_fp_acc.id
+    assert link_fp is not None and link_fp.external_id == "pluggy-rotated-fp"
+    assert pluggy_fp_acc.external_id == "pluggy-rotated-fp"
+
+    # SimpleFIN name-only rekeying still succeeds.
+    res_sf, link_sf, status_sf = await connection_service._resolve_sync_account(
+        session,
+        sf_conn,
+        AccountData(
+            external_id="sf-rotated-id",
+            name="Checking",
+            type="checking",
+            balance=Decimal("250.00"),
+            currency="USD",
+        ),
+        None,
+        incoming_external_ids={"sf-rotated-id"},
+        incoming_institution_external_ids=frozenset(),
+        claimed_account_ids=set(),
+    )
+    assert status_sf == "primary"
+    assert res_sf is not None and res_sf.id == sf_acc.id
+    assert link_sf is not None and link_sf.external_id == "sf-rotated-id"
+    assert sf_acc.external_id == "sf-rotated-id"
+
+
+def test_migration_148_backfill_unique_and_fails_loudly_on_duplicate_conn_ext():
+    """Migration 148 backfill creates primary links for all unique connected
+    accounts and raises RuntimeError listing conflicting rows when duplicate
+    (connection_id, external_id) accounts exist instead of silently dropping one."""
+    import importlib.util
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from alembic.operations import Operations
+    from alembic.runtime.migration import MigrationContext
+
+    mig_path = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "148_account_fingerprint_and_links.py"
+    )
+    source = mig_path.read_text(encoding="utf-8")
+    assert "ON CONFLICT (account_id, connection_id) DO NOTHING" in source
+    assert "ON CONFLICT DO NOTHING" not in source
+
+    spec = importlib.util.spec_from_file_location("mig_148_test", mig_path)
+    assert spec is not None and spec.loader is not None
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    def _create_pre_148_schema(conn: sa.Connection) -> None:
+        conn.execute(sa.text("CREATE TABLE workspaces (id TEXT PRIMARY KEY)"))
+        conn.execute(
+            sa.text(
+                "CREATE TABLE bank_connections ("
+                "id TEXT PRIMARY KEY, "
+                "last_sync_at TIMESTAMP"
+                ")"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "CREATE TABLE accounts ("
+                "id TEXT PRIMARY KEY, "
+                "workspace_id TEXT NOT NULL, "
+                "connection_id TEXT, "
+                "external_id TEXT, "
+                "stable_external_id TEXT"
+                ")"
+            )
+        )
+
+    # Case 1: Unique accounts (including NULL external_id fallback and manual account)
+    engine_ok = sa.create_engine("sqlite:///:memory:")
+    with engine_ok.begin() as conn:
+        _create_pre_148_schema(conn)
+        ws_id = uuid.uuid4().hex
+        conn_id = uuid.uuid4().hex
+        acc1_id = uuid.uuid4().hex
+        acc2_id = uuid.uuid4().hex
+        acc_null_ext_id = uuid.uuid4().hex
+        acc_manual_id = uuid.uuid4().hex
+        last_sync = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+
+        conn.execute(sa.text("INSERT INTO workspaces (id) VALUES (:id)"), {"id": ws_id})
+        conn.execute(
+            sa.text("INSERT INTO bank_connections (id, last_sync_at) VALUES (:id, :ts)"),
+            {"id": conn_id, "ts": last_sync.isoformat()},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO accounts (id, workspace_id, connection_id, external_id, stable_external_id) "
+                "VALUES (:id, :ws, :cid, :ext, :st)"
+            ),
+            [
+                {"id": acc1_id, "ws": ws_id, "cid": conn_id, "ext": "ext-1", "st": "st-1"},
+                {"id": acc2_id, "ws": ws_id, "cid": conn_id, "ext": "ext-2", "st": None},
+                {"id": acc_null_ext_id, "ws": ws_id, "cid": conn_id, "ext": None, "st": None},
+                {"id": acc_manual_id, "ws": ws_id, "cid": None, "ext": None, "st": None},
+            ],
+        )
+
+        ctx = MigrationContext.configure(conn)
+        with Operations.context(ctx):
+            mig.upgrade()
+
+        links = conn.execute(
+            sa.text(
+                "SELECT account_id, connection_id, external_id, stable_external_id, "
+                "is_primary_feed, status, last_synced_at "
+                "FROM account_connection_links ORDER BY account_id"
+            )
+        ).fetchall()
+        assert len(links) == 3
+        by_acc = {row[0]: row for row in links}
+        assert set(by_acc) == {acc1_id, acc2_id, acc_null_ext_id}
+        assert by_acc[acc1_id][2] == "ext-1"
+        assert by_acc[acc1_id][3] == "st-1"
+        assert by_acc[acc2_id][2] == "ext-2"
+        assert by_acc[acc_null_ext_id][2] == acc_null_ext_id
+        assert all(row[4] == 1 and row[5] == "active" and row[6] is not None for row in links)
+
+    # Case 2: Duplicate (connection_id, external_id) fails loudly with exact IDs
+    engine_dup = sa.create_engine("sqlite:///:memory:")
+    with engine_dup.begin() as conn:
+        _create_pre_148_schema(conn)
+        ws_id = uuid.uuid4().hex
+        conn_id = uuid.uuid4().hex
+        dup_acc_1 = uuid.uuid4().hex
+        dup_acc_2 = uuid.uuid4().hex
+
+        conn.execute(sa.text("INSERT INTO workspaces (id) VALUES (:id)"), {"id": ws_id})
+        conn.execute(
+            sa.text("INSERT INTO bank_connections (id, last_sync_at) VALUES (:id, NULL)"),
+            {"id": conn_id},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO accounts (id, workspace_id, connection_id, external_id, stable_external_id) "
+                "VALUES (:id, :ws, :cid, :ext, NULL)"
+            ),
+            [
+                {"id": dup_acc_1, "ws": ws_id, "cid": conn_id, "ext": "dup-ext-1"},
+                {"id": dup_acc_2, "ws": ws_id, "cid": conn_id, "ext": "dup-ext-1"},
+            ],
+        )
+
+        ctx = MigrationContext.configure(conn)
+        with Operations.context(ctx):
+            with pytest.raises(RuntimeError) as exc_info:
+                mig.upgrade()
+        msg = str(exc_info.value)
+        assert conn_id in msg
+        assert "dup-ext-1" in msg
+        assert dup_acc_1 in msg
+        assert dup_acc_2 in msg
+
+
+@pytest.mark.asyncio
+async def test_failover_reconciles_identical_same_day_purchases_one_to_one_and_guards_unequal_counts(
+    session: AsyncSession, test_user: User, test_workspace
+):
+    """Failover reconciles equal-count identical same-day purchases 1-to-1
+    (preserving user edits/categories and avoiding duplicates), keeps singleton
+    rekey working, and fails closed without reusing claimed rows when counts
+    are unequal (2 incoming vs 1 old, or 1 incoming vs 2 old)."""
+    from app.models.category import Category
+
+    ws_id = test_workspace.id
+    uid = test_user.id
+
+    coffee_cat = Category(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        name="Coffee",
+    )
+    session.add(coffee_cat)
+    await session.flush()
+
+    fp = hash_account_identifier("pluggy", "777788889999", institution="connector:201")
+    assert fp is not None
+    conn_a = BankConnection(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        provider="pluggy",
+        external_id="pluggy-twin-a",
+        institution_name="Itaú",
+        credentials={"item_id": "pluggy-twin-a", "connector_id": "201"},
+        status="expired",
+        created_at=datetime.now(timezone.utc),
+    )
+    conn_b = BankConnection(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        provider="pluggy",
+        external_id="pluggy-twin-b",
+        institution_name="Itaú",
+        credentials={"item_id": "pluggy-twin-b", "connector_id": "201"},
+        status="active",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add_all([conn_a, conn_b])
+    await session.flush()
+
+    joint = Account(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        connection_id=conn_a.id,
+        external_id="p-twin-acc-a",
+        account_fingerprint=fp,
+        masked_number="9999",
+        name="Joint Checking",
+        type="checking",
+        balance=Decimal("500.00"),
+        currency="BRL",
+    )
+    session.add(joint)
+    await session.flush()
+
+    t1 = datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 12, 15, 0, tzinfo=timezone.utc)
+    coffee_1 = Transaction(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        account_id=joint.id,
+        external_id="pluggy-a-coffee-1",
+        description="Cafe Central",
+        original_description="Cafe Central",
+        amount=Decimal("10.00"),
+        currency="BRL",
+        date=date(2026, 10, 12),
+        type="debit",
+        source="sync",
+        status="posted",
+        category_id=coffee_cat.id,
+        notes="Morning coffee",
+        created_at=t1,
+    )
+    coffee_2 = Transaction(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        account_id=joint.id,
+        external_id="pluggy-a-coffee-2",
+        description="Cafe Central",
+        original_description="Cafe Central",
+        amount=Decimal("10.00"),
+        currency="BRL",
+        date=date(2026, 10, 12),
+        type="debit",
+        source="sync",
+        status="posted",
+        category_id=coffee_cat.id,
+        notes="Afternoon coffee",
+        created_at=t2,
+    )
+    bakery = Transaction(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        account_id=joint.id,
+        external_id="pluggy-a-bakery-1",
+        description="Padaria Central",
+        original_description="Padaria Central",
+        amount=Decimal("18.50"),
+        currency="BRL",
+        date=date(2026, 10, 12),
+        type="debit",
+        source="sync",
+        status="posted",
+        notes="Bread",
+        created_at=t1,
+    )
+    session.add_all(
+        [
+            AccountConnectionLink(
+                workspace_id=ws_id,
+                account_id=joint.id,
+                connection_id=conn_a.id,
+                external_id="p-twin-acc-a",
+                account_fingerprint=fp,
+                is_primary_feed=True,
+                status="active",
+            ),
+            AccountConnectionLink(
+                workspace_id=ws_id,
+                account_id=joint.id,
+                connection_id=conn_b.id,
+                external_id="p-twin-acc-b",
+                account_fingerprint=fp,
+                is_primary_feed=False,
+                status="active",
+            ),
+            coffee_1,
+            coffee_2,
+            bakery,
+        ]
+    )
+    await session.commit()
+
+    # (a) & (b): 2 identical coffees + 1 singleton bakery under new failover IDs.
+    mock_pluggy = AsyncMock()
+    mock_pluggy.refresh_credentials = AsyncMock(return_value=conn_b.credentials)
+    mock_pluggy.get_institution_logo = AsyncMock(return_value=None)
+    mock_pluggy.get_accounts = AsyncMock(
+        return_value=[
+            AccountData(
+                external_id="p-twin-acc-b",
+                account_fingerprint=fp,
+                masked_number="9999",
+                name="Joint Checking",
+                type="checking",
+                balance=Decimal("461.50"),
+                currency="BRL",
+            )
+        ]
+    )
+    mock_pluggy.get_transactions = AsyncMock(
+        return_value=[
+            TransactionData(
+                external_id="pluggy-b-coffee-1",
+                description="Cafe Central",
+                amount=Decimal("10.00"),
+                date=date(2026, 10, 12),
+                type="debit",
+                currency="BRL",
+                status="posted",
+            ),
+            TransactionData(
+                external_id="pluggy-b-coffee-2",
+                description="Cafe Central",
+                amount=Decimal("10.00"),
+                date=date(2026, 10, 12),
+                type="debit",
+                currency="BRL",
+                status="posted",
+            ),
+            TransactionData(
+                external_id="pluggy-b-bakery-1",
+                description="Padaria Central",
+                amount=Decimal("18.50"),
+                date=date(2026, 10, 12),
+                type="debit",
+                currency="BRL",
+                status="posted",
+            ),
+        ]
+    )
+    mock_pluggy.get_bills = AsyncMock(return_value=[])
+
+    p1, p2, p3 = _patch_sync_helpers()
+    with patch("app.services.connection_service.get_provider", return_value=mock_pluggy), p1, p2, p3:
+        await connection_service.sync_connection(session, conn_b.id, ws_id, uid)
+
+    sync_txns = (
+        await session.execute(
+            select(Transaction).where(
+                Transaction.account_id == joint.id,
+                Transaction.source == "sync",
+            )
+        )
+    ).scalars().all()
+    assert len(sync_txns) == 3
+    by_id = {tx.id: tx for tx in sync_txns}
+    assert set(by_id) == {coffee_1.id, coffee_2.id, bakery.id}
+    assert by_id[coffee_1.id].external_id == "pluggy-b-coffee-1"
+    assert by_id[coffee_1.id].category_id == coffee_cat.id
+    assert by_id[coffee_1.id].notes == "Morning coffee"
+    assert by_id[coffee_2.id].external_id == "pluggy-b-coffee-2"
+    assert by_id[coffee_2.id].category_id == coffee_cat.id
+    assert by_id[coffee_2.id].notes == "Afternoon coffee"
+    assert by_id[bakery.id].external_id == "pluggy-b-bakery-1"
+    assert by_id[bakery.id].notes == "Bread"
+
+    # (c) Unequal/ambiguous counts must fail closed and never reuse a claimed row.
+    ambig_acc = Account(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        name="Ambiguous Check",
+        type="checking",
+        balance=Decimal("100.00"),
+        currency="BRL",
+    )
+    session.add(ambig_acc)
+    await session.flush()
+    old_one = Transaction(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        account_id=ambig_acc.id,
+        external_id="old-single-1",
+        description="Bus Ticket",
+        original_description="Bus Ticket",
+        amount=Decimal("5.00"),
+        currency="BRL",
+        date=date(2026, 10, 14),
+        type="debit",
+        source="sync",
+        status="posted",
+        created_at=t1,
+    )
+    old_pair_1 = Transaction(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        account_id=ambig_acc.id,
+        external_id="old-pair-1",
+        description="Metro Ride",
+        original_description="Metro Ride",
+        amount=Decimal("6.00"),
+        currency="BRL",
+        date=date(2026, 10, 14),
+        type="debit",
+        source="sync",
+        status="posted",
+        created_at=t1,
+    )
+    old_pair_2 = Transaction(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        account_id=ambig_acc.id,
+        external_id="old-pair-2",
+        description="Metro Ride",
+        original_description="Metro Ride",
+        amount=Decimal("6.00"),
+        currency="BRL",
+        date=date(2026, 10, 14),
+        type="debit",
+        source="sync",
+        status="posted",
+        created_at=t2,
+    )
+    session.add_all([old_one, old_pair_1, old_pair_2])
+    await session.commit()
+
+    # 2 incoming vs 1 old -> neither matches
+    bus_a = TransactionData(
+        external_id="new-bus-a",
+        description="Bus Ticket",
+        amount=Decimal("5.00"),
+        date=date(2026, 10, 14),
+        type="debit",
+        currency="BRL",
+        status="posted",
+    )
+    bus_b = TransactionData(
+        external_id="new-bus-b",
+        description="Bus Ticket",
+        amount=Decimal("5.00"),
+        date=date(2026, 10, 14),
+        type="debit",
+        currency="BRL",
+        status="posted",
+    )
+    for item in (bus_a, bus_b):
+        assert (
+            await connection_service._find_synced_duplicate(
+                session,
+                ambig_acc.id,
+                item,
+                {"new-bus-a", "new-bus-b"},
+                incoming_batch=[bus_a, bus_b],
+                provider="pluggy",
+                allow_booked_dedup=True,
+                claimed_booked_ids=set(),
+                matched_incoming_external_ids=set(),
+            )
+            is None
+        )
+
+    # 1 incoming vs 2 old -> does not mis-rekey either stored row
+    metro_one = TransactionData(
+        external_id="new-metro-1",
+        description="Metro Ride",
+        amount=Decimal("6.00"),
+        date=date(2026, 10, 14),
+        type="debit",
+        currency="BRL",
+        status="posted",
+    )
+    assert (
+        await connection_service._find_synced_duplicate(
+            session,
+            ambig_acc.id,
+            metro_one,
+            {"new-metro-1"},
+            incoming_batch=[metro_one],
+            provider="pluggy",
+            allow_booked_dedup=True,
+            claimed_booked_ids=set(),
+            matched_incoming_external_ids=set(),
+        )
+        is None
+    )
+
+    # Already-claimed old row must never be reused.
+    claimed = {old_one.id}
+    assert (
+        await connection_service._find_synced_duplicate(
+            session,
+            ambig_acc.id,
+            bus_a,
+            {"new-bus-a"},
+            incoming_batch=[bus_a],
+            provider="pluggy",
+            allow_booked_dedup=True,
+            claimed_booked_ids=claimed,
+            matched_incoming_external_ids=set(),
+        )
+        is None
+    )
+
+
+def test_hash_account_identifier_rejects_short_masked_prefixes():
+    """Short masked prefixes exposing only a 4-digit (or shorter) suffix must
+    return None while full identifiers remain eligible."""
+    for masked in (
+        "XX 1234",
+        "XX-1234",
+        "XXX 1234",
+        "XXX1234",
+        "XX1234",
+        "XXXX 1234",
+        "** 1234",
+        "•• 1234",
+    ):
+        assert (
+            hash_account_identifier("pluggy", masked, institution="connector:201")
+            is None
+        ), f"Expected masked identifier {masked!r} to be rejected"
+
+    for valid in (
+        "1234-56789",
+        "DE89370400440532013000",
+        "X123456",
+        "12345-X",
+    ):
+        digest = hash_account_identifier("pluggy", valid, institution="connector:201")
+        assert digest is not None and len(digest) == 64, f"Expected {valid!r} to hash"
+
+
+@pytest.mark.asyncio
+async def test_empty_oauth_discovery_does_not_advance_checkpoint_and_first_sync_fetches_full_history(
+    session: AsyncSession, test_user: User, test_workspace
+):
+    """When handle_oauth_callback discovers no accounts (e.g. Enable Banking
+    returning only UID strings at auth), connection.last_sync_at must stay None
+    and the first regular sync discovering accounts must fetch full history
+    (since=None), as must any brand-new account discovered on later syncs."""
+    ws_id = test_workspace.id
+    uid = test_user.id
+
+    oauth_provider = AsyncMock()
+    oauth_provider.handle_oauth_callback = AsyncMock(
+        return_value=ConnectionData(
+            external_id="eb-empty-oauth",
+            institution_name="NordicBank",
+            credentials={"session_id_enc": "enc-1", "account_uids": ["eb-uid-1"]},
+            accounts=[],
+        )
+    )
+    oauth_provider.get_holdings = AsyncMock(return_value=[])
+
+    p1, p2, p3 = _patch_sync_helpers()
+    with patch("app.services.connection_service.get_provider", return_value=oauth_provider), p1, p2, p3:
+        conn = await connection_service.handle_oauth_callback(
+            session,
+            ws_id,
+            uid,
+            "code-empty-discovery",
+            provider_name="enable_banking",
+        )
+
+    assert conn.last_sync_at is None
+
+    # First regular sync discovers eb-uid-1: must request since=None (full history).
+    sync_provider = AsyncMock()
+    sync_provider.refresh_credentials = AsyncMock(return_value=conn.credentials)
+    sync_provider.get_institution_logo = AsyncMock(return_value=None)
+    sync_provider.get_accounts = AsyncMock(
+        return_value=[
+            AccountData(
+                external_id="eb-uid-1",
+                name="Primary Checking",
+                type="checking",
+                balance=Decimal("200.00"),
+                currency="EUR",
+            )
+        ]
+    )
+    sync_provider.get_transactions = AsyncMock(return_value=[])
+    sync_provider.get_bills = AsyncMock(return_value=[])
+    sync_provider.incomplete_account_ids = set()
+    sync_provider.truncated_account_ids = set()
+
+    p1, p2, p3 = _patch_sync_helpers()
+    with patch("app.services.connection_service.get_provider", return_value=sync_provider), p1, p2, p3:
+        conn, _, _ = await connection_service.sync_connection(session, conn.id, ws_id, uid)
+
+    sync_provider.get_transactions.assert_awaited_once()
+    assert sync_provider.get_transactions.await_args is not None
+    assert sync_provider.get_transactions.await_args.args[2] is None
+    assert conn.last_sync_at is not None
+
+    # Second regular sync discovers a brand-new account eb-uid-2 while eb-uid-1
+    # already synced: eb-uid-1 uses incremental window, eb-uid-2 gets since=None.
+    sync_provider.get_accounts = AsyncMock(
+        return_value=[
+            AccountData(
+                external_id="eb-uid-1",
+                name="Primary Checking",
+                type="checking",
+                balance=Decimal("200.00"),
+                currency="EUR",
+            ),
+            AccountData(
+                external_id="eb-uid-2",
+                name="New Savings",
+                type="savings",
+                balance=Decimal("500.00"),
+                currency="EUR",
+            ),
+        ]
+    )
+    sync_provider.get_transactions = AsyncMock(return_value=[])
+
+    p1, p2, p3 = _patch_sync_helpers()
+    with patch("app.services.connection_service.get_provider", return_value=sync_provider), p1, p2, p3:
+        await connection_service.sync_connection(session, conn.id, ws_id, uid)
+
+    calls_by_ext = {
+        call.args[1]: call.args[2]
+        for call in sync_provider.get_transactions.await_args_list
+    }
+    assert calls_by_ext["eb-uid-1"] is not None
+    assert calls_by_ext["eb-uid-2"] is None
+
+
+@pytest.mark.asyncio
+async def test_regular_sync_new_account_keeps_full_balance_when_transaction_fetch_fails(
+    session: AsyncSession, test_user: User, test_workspace
+):
+    """During a regular sync, pre-import registration of a new account must
+    commit the full reported balance (without auto_invested deduction) so a
+    failed transaction fetch never leaves a reduced balance without its holding,
+    and a subsequent succeeding sync commits the deduction with the holding."""
+    from app.models.asset import Asset
+    from app.providers.base import HoldingData
+
+    ws_id = test_workspace.id
+    uid = test_user.id
+
+    conn = BankConnection(
+        id=uuid.uuid4(),
+        user_id=uid,
+        workspace_id=ws_id,
+        provider="pluggy",
+        external_id="pluggy-reg-auto-inv",
+        institution_name="AutoInv Bank",
+        credentials={"item_id": "pluggy-reg-auto-inv", "connector_id": "201"},
+        settings={"sync_assets": True},
+        status="active",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(conn)
+    await session.commit()
+
+    acc_data = AccountData(
+        external_id="reg-auto-acc-1",
+        name="Auto-Invest Checking",
+        type="checking",
+        balance=Decimal("1000.00"),
+        currency="BRL",
+        auto_invested_balance=Decimal("400.00"),
+    )
+    holding = HoldingData(
+        external_id="reg-auto-holding-1",
+        name="CDB Automatico",
+        currency="BRL",
+        current_value=Decimal("400.00"),
+        account_external_id="reg-auto-acc-1",
+    )
+
+    mock_provider = AsyncMock()
+    mock_provider.refresh_credentials = AsyncMock(return_value=conn.credentials)
+    mock_provider.get_institution_logo = AsyncMock(return_value=None)
+    mock_provider.get_accounts = AsyncMock(return_value=[acc_data])
+    mock_provider.get_holdings = AsyncMock(return_value=[holding])
+    mock_provider.get_transactions = AsyncMock(
+        side_effect=RuntimeError("transactions fetch failed")
+    )
+    mock_provider.get_bills = AsyncMock(return_value=[])
+
+    p1, p2, p3 = _patch_sync_helpers()
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider), p1, p2, p3:
+        with pytest.raises(RuntimeError, match="transactions fetch failed"):
+            await connection_service.sync_connection(session, conn.id, ws_id, uid)
+
+    session.expunge_all()
+    acc = (
+        await session.execute(
+            select(Account).where(
+                Account.connection_id == conn.id,
+                Account.external_id == "reg-auto-acc-1",
+            )
+        )
+    ).scalar_one()
+    assert acc.balance == Decimal("1000.00")
+    assets = (
+        await session.execute(select(Asset).where(Asset.connection_id == conn.id))
+    ).scalars().all()
+    assert assets == []
+
+    # Next sync succeeds: balance deducts 400 and holding commits together.
+    mock_provider.get_transactions = AsyncMock(return_value=[])
+    p1, p2, p3 = _patch_sync_helpers()
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider), p1, p2, p3:
+        await connection_service.sync_connection(session, conn.id, ws_id, uid)
+
+    session.expunge_all()
+    acc_after = (
+        await session.execute(
+            select(Account).where(
+                Account.connection_id == conn.id,
+                Account.external_id == "reg-auto-acc-1",
+            )
+        )
+    ).scalar_one()
+    assert acc_after.balance == Decimal("600.00")
+    assets_after = (
+        await session.execute(select(Asset).where(Asset.connection_id == conn.id))
+    ).scalars().all()
+    assert len(assets_after) == 1
+    assert assets_after[0].external_id == "reg-auto-holding-1"

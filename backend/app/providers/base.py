@@ -264,7 +264,13 @@ def hash_account_identifier_with_fallbacks(
     if "*" in stripped or "•" in stripped:
         return None, ()
     cleaned = "".join(ch for ch in stripped if ch.isalnum()).upper()
-    if "XXXX" in cleaned or len(cleaned) < min_length or len(set(cleaned)) <= 1:
+    if (
+        "XXXX" in cleaned
+        or len(cleaned) < min_length
+        or len(set(cleaned)) <= 1
+        or (cleaned.startswith("XX") and len(cleaned.lstrip("X")) < min_length)
+        or (cleaned.endswith("XX") and len(cleaned.rstrip("X")) < min_length)
+    ):
         return None, ()
     from app.core.config import get_settings
 
