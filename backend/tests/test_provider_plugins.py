@@ -126,8 +126,8 @@ def payload_data(*, transactions: Any = "default", holdings: Any = "default") ->
     }
 
 
-def adapter(data: dict[str, Any]) -> PluginPayloadProvider:
-    payload = parse_payload(data, ALL_KINDS)
+def adapter(data: dict[str, Any], provides: list[str] | None = None) -> PluginPayloadProvider:
+    payload = parse_payload(data, ALL_KINDS if provides is None else provides)
     assert payload is not None
     return PluginPayloadProvider(provider_name(PLUGIN), payload)
 
@@ -144,9 +144,9 @@ async def bank_connection(session: AsyncSession, test_user, test_workspace) -> B
     return connection
 
 
-async def _pipeline(session, connection, data, user):
+async def _pipeline(session, connection, data, user, *, provides: list[str] | None = None):
     return await connection_service.sync_connection(
-        session, connection.id, connection.workspace_id, user.id, provider=adapter(data)
+        session, connection.id, connection.workspace_id, user.id, provider=adapter(data, provides)
     )
 
 
@@ -1320,6 +1320,9 @@ async def test_incremental_delta_advances_last_sync_and_preserves_same_day_repea
     await _pipeline(session, bank_connection, first, test_user)
     await session.refresh(bank_connection)
     assert bank_connection.last_sync_at is not None
+    # Step the stored timestamp back slightly so the strict advance check is deterministic.
+    previous_sync_at = bank_connection.last_sync_at - timedelta(seconds=5)
+    bank_connection.last_sync_at = previous_sync_at
 
     (account,) = await _rows(session, Account, connection_id=bank_connection.id)
     account_id = account.id
@@ -1335,6 +1338,8 @@ async def test_incremental_delta_advances_last_sync_and_preserves_same_day_repea
     )
     second["accounts"][0]["incremental"] = True
     await _pipeline(session, bank_connection, second, test_user)
+    await session.refresh(bank_connection)
+    assert bank_connection.last_sync_at is not None and bank_connection.last_sync_at > previous_sync_at
 
     ext_ids = {row.external_id for row in await _rows(session, Transaction, account_id=account_id)}
     assert ext_ids == {"xfer-1", "xfer-2"}
@@ -2347,3 +2352,171 @@ async def test_omitted_holdings_deducts_retained_investment_holdings_and_handles
     }
     assert assets_after_empty["h-vti"].is_archived is True
     assert assets_after_empty["h-vxus"].is_archived is True
+
+
+@pytest.mark.asyncio
+async def test_replaces_external_id_reserves_pending_hold_against_earlier_posted_twin_in_same_batch(
+    session: AsyncSession, bank_connection, test_user
+):
+    """When one batch contains an unrelated posted entry matching a stored hold's
+    heuristic fingerprint BEFORE the posted entry that explicitly names that hold
+    via `replaces_external_id`, `_find_synced_duplicate` must skip the reserved
+    hold so the unrelated entry inserts cleanly and the named settlement upgrades
+    the hold in place."""
+    from app.models.category import Category
+
+    cat = Category(
+        user_id=test_user.id,
+        workspace_id=bank_connection.workspace_id,
+        name="Dining",
+        icon="utensils",
+        color="#FF5500",
+    )
+    session.add(cat)
+    await session.flush()
+    cat_id = cat.id
+
+    pending = [
+        {
+            "external_id": "hold-bistro",
+            "description": "Corner Bistro",
+            "amount": "20.00",
+            "date": "2026-11-15",
+            "type": "debit",
+            "status": "pending",
+        }
+    ]
+    await _pipeline(session, bank_connection, payload_data(transactions=pending, holdings=None), test_user)
+    (account,) = await _rows(session, Account, connection_id=bank_connection.id)
+    account_id = account.id
+    (stored_hold,) = await _rows(session, Transaction, account_id=account_id)
+    hold_id = stored_hold.id
+    stored_hold.category_id = cat_id
+    await session.commit()
+
+    # Order matters: the $20 unrelated posted entry arrives BEFORE the $24 named settlement.
+    delta = payload_data(
+        transactions=[
+            {
+                "external_id": "posted-unrelated",
+                "description": "Corner Bistro",
+                "amount": "20.00",
+                "date": "2026-11-15",
+                "type": "debit",
+                "status": "posted",
+            },
+            {
+                "external_id": "posted-settled",
+                "replaces_external_id": "hold-bistro",
+                "description": "Corner Bistro",
+                "amount": "24.00",
+                "date": "2026-11-15",
+                "type": "debit",
+                "status": "posted",
+            },
+        ],
+        holdings=None,
+    )
+    delta["accounts"][0]["incremental"] = True
+    delta["accounts"][0]["removed_transaction_ids"] = ["hold-bistro"]
+    await _pipeline(session, bank_connection, delta, test_user)
+
+    after = {r.external_id: r for r in await _rows(session, Transaction, account_id=account_id)}
+    assert set(after) == {"posted-unrelated", "posted-settled"}
+    assert after["posted-settled"].id == hold_id
+    assert after["posted-settled"].amount == Decimal("24.00")
+    assert after["posted-settled"].category_id == cat_id
+    assert after["posted-unrelated"].id != hold_id
+    assert after["posted-unrelated"].amount == Decimal("20.00")
+    assert after["posted-unrelated"].category_id is None
+
+
+@pytest.mark.asyncio
+async def test_replaces_external_id_preserves_retained_bill_due_date_when_settlement_omits_bill_id(
+    session: AsyncSession, bank_connection, test_user
+):
+    """When a pending credit-card row linked to a CreditCardBill settles on a
+    shifted date crossing statement_close_day without sending a new bill_external_id,
+    effective_date stays aligned with the retained bill's due_date."""
+    from app.models.credit_card_bill import CreditCardBill
+
+    first = {
+        "contract": 1,
+        "accounts": [
+            {
+                "external_id": "cc-bill-1",
+                "name": "Rewards Card",
+                "type": "credit_card",
+                "balance": "100.00",
+                "currency": "USD",
+                "statement_close_day": 15,
+                "payment_due_day": 25,
+                "bills": [
+                    {
+                        "external_id": "bill-nov",
+                        "due_date": "2026-11-25",
+                        "total_amount": "100.00",
+                        "currency": "USD",
+                    }
+                ],
+                "transactions": [
+                    {
+                        "external_id": "cc-hold-1",
+                        "description": "Airline Hold",
+                        "amount": "100.00",
+                        "date": "2026-11-14",
+                        "type": "debit",
+                        "status": "pending",
+                        "bill_external_id": "bill-nov",
+                    }
+                ],
+            }
+        ],
+    }
+    bill_kinds = ["accounts", "transactions", "bills"]
+    await _pipeline(session, bank_connection, first, test_user, provides=bill_kinds)
+    (account,) = await _rows(session, Account, connection_id=bank_connection.id)
+    account_id = account.id
+    (bill,) = await _rows(session, CreditCardBill, account_id=account_id)
+    bill_id = bill.id
+    (before,) = await _rows(session, Transaction, account_id=account_id)
+    before_id = before.id
+    assert before.bill_id == bill_id
+    assert before.effective_date == date(2026, 11, 25)
+
+    # Settle after statement_close_day (16 > 15) without supplying bill_external_id.
+    second = {
+        "contract": 1,
+        "accounts": [
+            {
+                "external_id": "cc-bill-1",
+                "name": "Rewards Card",
+                "type": "credit_card",
+                "balance": "100.00",
+                "currency": "USD",
+                "statement_close_day": 15,
+                "payment_due_day": 25,
+                "incremental": True,
+                "transactions": [
+                    {
+                        "external_id": "cc-posted-1",
+                        "replaces_external_id": "cc-hold-1",
+                        "description": "Airline Hold",
+                        "amount": "100.00",
+                        "date": "2026-11-16",
+                        "type": "debit",
+                        "status": "posted",
+                    }
+                ],
+                "removed_transaction_ids": ["cc-hold-1"],
+            }
+        ],
+    }
+    await _pipeline(session, bank_connection, second, test_user, provides=bill_kinds)
+
+    (after,) = await _rows(session, Transaction, account_id=account_id)
+    assert after.id == before_id
+    assert after.status == "posted"
+    assert after.date == date(2026, 11, 16)
+    assert after.bill_id == bill_id
+    assert after.effective_date == date(2026, 11, 25)

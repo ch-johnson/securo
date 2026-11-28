@@ -4042,7 +4042,8 @@
       "connected": "已连接 {{name}}",
       "failed": "无法完成登录，请重试。",
       "missing": "该服务未返回登录信息，请重试。",
-      "serviceError": "该服务返回错误：{{message}}"
+      "serviceError": "该服务返回错误：{{message}}",
+      "storageFailed": "无法在此浏览器中保存登录状态。请启用浏览器存储后重试。"
     },
     "onlyForBusiness": "仅限企业工作区",
     "onlyForPersonal": "仅限个人工作区"

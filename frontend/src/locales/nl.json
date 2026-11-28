@@ -4044,7 +4044,8 @@
       "connected": "{{name}} gekoppeld",
       "failed": "Het inloggen kon niet worden afgerond. Probeer het opnieuw.",
       "missing": "De dienst gaf het inloggen niet terug. Probeer het opnieuw.",
-      "serviceError": "De dienst meldde een fout: {{message}}"
+      "serviceError": "De dienst meldde een fout: {{message}}",
+      "storageFailed": "De aanmeldstatus kon niet in deze browser worden opgeslagen. Schakel browseropslag in en probeer het opnieuw."
     },
     "onlyForBusiness": "Alleen zakelijke workspaces",
     "onlyForPersonal": "Alleen persoonlijke workspaces"

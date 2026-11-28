@@ -201,7 +201,9 @@ unknown fields are refused. The rules that catch people out:
   date-window snapshot. Securo advances `last_sync_at` normally while skipping
   window-based hold expiry and phantom-duplicate cleanup. Send explicit
   deletions in `removed_transaction_ids` (unique, disjoint from `transactions`;
-  Securo deletes only untouched synced rows) and link a newly posted entry to
+  include `"transactions": []` on removal-only deltas, since omitting
+  `transactions` alongside `removed_transaction_ids` is refused; Securo deletes
+  only untouched synced rows) and link a newly posted entry to
   the pending entry it settles via `replaces_external_id` so the pending row
   upgrades in place even when the settled amount or date changed.
 - **Loan contract terms**: `loan` accounts may optionally include `loan_kind`,

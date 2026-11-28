@@ -886,6 +886,12 @@ class PlaidPlugin:
             if trades_by_key is not None:
                 holding["trades"] = trades_by_key.get((acc_id, sec_id), [])
 
+            if current_value > 0 and currency != acc_currency:
+                # The holding is valued in a different currency from its owning
+                # account's gross balance, and the plugin has no FX access to
+                # compute an account-currency deduction without double-counting.
+                incomplete = True
+                break
             if len(holdings) >= MAX_SYNC_HOLDINGS:
                 # Publishing a truncated snapshot would archive positions beyond the cap.
                 incomplete = True
@@ -1229,16 +1235,18 @@ class PlaidPlugin:
             elif acc_type == "loan":
                 entry["loan_kind"] = _map_loan_kind(raw.get("subtype"))
             elif acc_type == "investment":
-                auto_inv = auto_invested_by_account.get(acc_id)
-                if auto_inv is not None and auto_inv > 0:
-                    entry["auto_invested_balance"] = _money_str(auto_inv)
-                elif holdings_payload is None and balance > 0:
-                    # Plaid investment account balances include securities. When the
-                    # holdings snapshot is omitted (incomplete valuation, cap, or
-                    # product unavailable), cap auto_invested_balance at the gross
-                    # balance so Securo deducts retained live holdings without
-                    # double-counting net worth or pushing cash negative.
-                    entry["auto_invested_balance"] = _money_str(balance)
+                if current_balance is not None:
+                    auto_inv = auto_invested_by_account.get(acc_id)
+                    if auto_inv is not None and auto_inv > 0:
+                        entry["auto_invested_balance"] = _money_str(auto_inv)
+                    elif holdings_payload is None and current_balance > 0:
+                        # Plaid investment account balances include securities when `current`
+                        # is present (`available` is cash only, so never deduct when `current`
+                        # is null). When the holdings snapshot is omitted (incomplete valuation,
+                        # cross-currency holding, cap, or product unavailable), cap
+                        # auto_invested_balance at `current` so Securo deducts retained live
+                        # holdings without double-counting net worth or pushing cash negative.
+                        entry["auto_invested_balance"] = _money_str(current_balance)
 
             liability = liabilities_by_account.get(acc_id)
             if liability is not None:

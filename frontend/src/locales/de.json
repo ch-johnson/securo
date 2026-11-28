@@ -4043,7 +4043,8 @@
       "connected": "{{name}} verbunden",
       "failed": "Die Anmeldung konnte nicht abgeschlossen werden. Versuche es erneut.",
       "missing": "Der Dienst hat die Anmeldung nicht zurückgegeben. Versuche es erneut.",
-      "serviceError": "Der Dienst meldete einen Fehler: {{message}}"
+      "serviceError": "Der Dienst meldete einen Fehler: {{message}}",
+      "storageFailed": "Der Anmeldestatus konnte in diesem Browser nicht gespeichert werden. Aktivieren Sie den Browserspeicher und versuchen Sie es erneut."
     },
     "onlyForBusiness": "Nur geschäftliche Workspaces",
     "onlyForPersonal": "Nur persönliche Workspaces"

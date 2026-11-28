@@ -4200,7 +4200,8 @@
       "connected": "Połączono: {{name}}",
       "failed": "Nie udało się dokończyć logowania. Spróbuj ponownie.",
       "missing": "Usługa nie zwróciła logowania. Spróbuj ponownie.",
-      "serviceError": "Usługa zgłosiła błąd: {{message}}"
+      "serviceError": "Usługa zgłosiła błąd: {{message}}",
+      "storageFailed": "Nie udało się zapisać stanu logowania w tej przeglądarce. Włącz pamięć przeglądarki i spróbuj ponownie."
     },
     "onlyForBusiness": "Tylko firmowe obszary robocze",
     "onlyForPersonal": "Tylko osobiste obszary robocze"

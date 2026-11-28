@@ -4250,7 +4250,8 @@
       "connected": "{{name}}: připojeno",
       "failed": "Přihlášení se nepodařilo dokončit. Zkuste to znovu.",
       "missing": "Služba přihlášení nevrátila. Zkuste to znovu.",
-      "serviceError": "Služba nahlásila chybu: {{message}}"
+      "serviceError": "Služba nahlásila chybu: {{message}}",
+      "storageFailed": "Stav přihlášení se nepodařilo v tomto prohlížeči uložit. Povolte úložiště prohlížeče a zkuste to znovu."
     },
     "onlyForBusiness": "Pouze firemní pracovní prostory",
     "onlyForPersonal": "Pouze osobní pracovní prostory"

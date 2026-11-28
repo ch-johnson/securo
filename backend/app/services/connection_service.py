@@ -2489,7 +2489,11 @@ async def _run_first_import(
             # id with a different status, fingerprint match prevents the
             # second copy from landing.
             synced_dup = await _find_synced_duplicate(
-                session, account.id, txn_data, incoming_external_ids
+                session,
+                account.id,
+                txn_data,
+                incoming_external_ids,
+                reserved_external_ids=superseded_pending_ids,
             )
             if synced_dup:
                 settles = synced_dup.status == "pending" and txn_data.status == "posted"
@@ -3472,6 +3476,7 @@ async def _find_synced_duplicate(
     incoming_external_ids: set[str],
     live_external_ids: Optional[set[str]] = None,
     incoming_batch: Sequence[TransactionData] = (),
+    reserved_external_ids: Optional[set[str]] = None,
 ) -> Optional[Transaction]:
     """Find an existing row that the incoming `txn_data` is a twin of.
 
@@ -3502,6 +3507,7 @@ async def _find_synced_duplicate(
     lists look gone. ``incoming_batch`` is the fetch `txn_data` came from;
     it and ``live_external_ids`` let Path 4 match a reworded remittance text.
     """
+    excluded = reserved_external_ids or set()
     # Path 1: installment fingerprint. Highly specific, so we don't require a
     # description match on top.
     if (
@@ -3522,7 +3528,10 @@ async def _find_synced_duplicate(
             )
         )
         for candidate in result.scalars():
-            if candidate.external_id and candidate.external_id.startswith("bill_charge:"):
+            if candidate.external_id and (
+                candidate.external_id.startswith("bill_charge:")
+                or candidate.external_id in excluded
+            ):
                 continue
             return candidate
 
@@ -3547,7 +3556,10 @@ async def _find_synced_duplicate(
         )
     )
     for candidate in result.scalars():
-        if candidate.external_id and candidate.external_id.startswith("bill_charge:"):
+        if candidate.external_id and (
+            candidate.external_id.startswith("bill_charge:")
+            or candidate.external_id in excluded
+        ):
             continue
         if token_overlap(
             strip_sepa_prefix(candidate.original_description or candidate.description or ""),
@@ -3585,7 +3597,7 @@ async def _find_synced_duplicate(
         for candidate in result.scalars():
             if candidate.external_id and candidate.external_id.startswith("bill_charge:"):
                 continue
-            if candidate.external_id in incoming_external_ids:
+            if candidate.external_id in incoming_external_ids or candidate.external_id in excluded:
                 continue
             candidate_raw = candidate.raw_data if isinstance(candidate.raw_data, dict) else {}
             candidate_descriptions = (
@@ -3670,7 +3682,7 @@ async def _find_synced_duplicate(
         late_ref_matches = []
         rewritten_ref_matches = []
         for candidate in result.scalars():
-            if candidate.external_id in incoming_external_ids:
+            if candidate.external_id in incoming_external_ids or candidate.external_id in excluded:
                 continue
             if not isinstance(candidate.raw_data, dict):
                 continue
@@ -3744,7 +3756,7 @@ async def _find_synced_duplicate(
         txn_data,
         LOCAL_IMPORT_SOURCES,
         unclaimed_only=True,
-        exclude_external_ids=incoming_external_ids,
+        exclude_external_ids=incoming_external_ids | excluded,
     )
     if local_match is not None or live_external_ids is None:
         return local_match
@@ -3753,7 +3765,7 @@ async def _find_synced_duplicate(
     # `_find_settled_eb_hold`. Last, so it never takes a row another path
     # would have matched. Only Enable Banking syncs pass `live_external_ids`.
     return await _find_settled_eb_hold(
-        session, account_id, txn_data, live_external_ids, incoming_batch,
+        session, account_id, txn_data, live_external_ids | excluded, incoming_batch,
     )
 
 
@@ -4189,6 +4201,8 @@ async def _settle_replaced_pending(
                 if txn_data.bill_external_id
                 else None
             )
+            if bill is None and pending_tx.bill_id is not None:
+                bill = await session.get(CreditCardBill, pending_tx.bill_id)
             apply_effective_date(
                 pending_tx, account, bill_due_date=bill.due_date if bill else None
             )
@@ -5655,6 +5669,7 @@ async def sync_connection(
                     incoming_txn_external_ids,
                     live_external_ids=hold_live_ids,
                     incoming_batch=transactions_data,
+                    reserved_external_ids=superseded_pending_ids,
                 )
                 if synced_dup:
                     settles = synced_dup.status == "pending" and txn_data.status == "posted"

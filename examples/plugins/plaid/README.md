@@ -59,6 +59,21 @@ Clicking **Sign in** / **Reconnect** opens Plaid Hosted Link in **Update Mode**
 using the existing `access_token`, preserving the same Item ID, accounts, and
 transaction history without duplicates.
 
+## Disconnecting and Plaid billing
+
+Deleting a connection in Securo deletes the locally sealed `access_token` and
+secrets, and does **not** call Plaid's `/item/remove`. On paid Plaid Production
+plans, Plaid continues billing monthly per active Item for Transactions,
+Liabilities, and Investments while its `access_token` remains valid, even when
+Securo stops syncing.
+
+To stop Plaid billing for an Item, remove it via `/item/remove` (or ask Plaid
+Support to remove it) **before** deleting the connection in Securo. Because
+Securo seals the `access_token` and never exposes it in the UI—and deletes its
+stored copy when the connection is removed—operators on paid Production plans
+who need the `access_token` for `/item/remove` can request a list of active
+`access_token`s for their `client_id` from Plaid Support.
+
 ## Zero third-party dependencies
 
 `plaid_plugin.py` uses Python's standard library only (`urllib.request`,

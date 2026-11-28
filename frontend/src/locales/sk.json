@@ -4234,7 +4234,8 @@
       "connected": "{{name}}: pripojené",
       "failed": "Prihlásenie sa nepodarilo dokončiť. Skúste to znova.",
       "missing": "Služba prihlásenie nevrátila. Skúste to znova.",
-      "serviceError": "Služba nahlásila chybu: {{message}}"
+      "serviceError": "Služba nahlásila chybu: {{message}}",
+      "storageFailed": "Stav prihlásenia sa nepodarilo v tomto prehliadači uložiť. Povoľte úložisko prehliadača a skúste to znova."
     },
     "onlyForBusiness": "Iba firemné pracovné priestory",
     "onlyForPersonal": "Iba osobné pracovné priestory"

@@ -4042,7 +4042,8 @@
       "connected": "{{name}} csatlakoztatva",
       "failed": "Nem sikerült befejezni a bejelentkezést. Próbáld újra.",
       "missing": "A szolgáltatás nem küldte vissza a bejelentkezést. Próbáld újra.",
-      "serviceError": "A szolgáltatás hibát jelzett: {{message}}"
+      "serviceError": "A szolgáltatás hibát jelzett: {{message}}",
+      "storageFailed": "Nem sikerült menteni a bejelentkezési állapotot ebben a böngészőben. Engedélyezze a böngésző tárhelyét, majd próbálja újra."
     },
     "onlyForBusiness": "Csak üzleti munkaterületek",
     "onlyForPersonal": "Csak személyes munkaterületek"

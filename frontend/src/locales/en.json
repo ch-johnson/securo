@@ -4042,7 +4042,8 @@
       "connected": "{{name}} connected",
       "failed": "The sign in couldn't be finished. Try again.",
       "missing": "The service didn't send the sign in back. Try again.",
-      "serviceError": "The service reported an error: {{message}}"
+      "serviceError": "The service reported an error: {{message}}",
+      "storageFailed": "Couldn't save the sign-in state in this browser. Enable browser storage and try again."
     },
     "onlyForBusiness": "Business workspaces only",
     "onlyForPersonal": "Personal workspaces only"

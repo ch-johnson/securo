@@ -583,25 +583,32 @@ async def finish_oauth(
     ):
         raise PluginConnectionError("this sign-in link expired or wasn't started here; try again")
     connection = await get_connection(session, workspace_id, uuid.UUID(payload["connection_id"]))
-    result, secrets = await _call(
-        session,
-        connection,
-        "oauth_exchange",
-        {
-            "code": code or "",
-            "redirect_uri": redirect_uri(),
-            "params": dict(params or {}),
-            "connection_state": dict(connection.state or {}),
-        },
-    )
-    signed_in = _keep(connection, result, secrets)
-    connection.status = "pending"
-    connection.last_error = None
-    if signed_in:
-        await _forget_bank_failure(session, connection)
-    await _mirror_status(session, connection)
-    await session.commit()
-    return connection
+    lock = f"plugin-sync:{connection.id}"
+    if not await _acquire(lock):
+        raise PluginConnectionError("this connection is syncing right now; try again in a moment")
+    try:
+        await session.refresh(connection)
+        result, secrets = await _call(
+            session,
+            connection,
+            "oauth_exchange",
+            {
+                "code": code or "",
+                "redirect_uri": redirect_uri(),
+                "params": dict(params or {}),
+                "connection_state": dict(connection.state or {}),
+            },
+        )
+        signed_in = _keep(connection, result, secrets)
+        connection.status = "pending"
+        connection.last_error = None
+        if signed_in:
+            await _forget_bank_failure(session, connection)
+        await _mirror_status(session, connection)
+        await session.commit()
+        return connection
+    finally:
+        await _release(lock)
 
 
 async def _forget_bank_failure(session: AsyncSession, connection: PluginConnection) -> None:

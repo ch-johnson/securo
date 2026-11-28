@@ -1052,3 +1052,31 @@ plugin = Plugin()
     unsealed = vault.unseal(connection.secrets)
     assert unsealed["refresh_token"] == "rot-2"
     assert unsealed["pending_link_token"] == "link-tok-2"
+
+    # 3. finish_oauth also holds the per-connection lock and refreshes rotated secrets.
+    _, state_busy = await connections.start_oauth(session, connection, user_id=user_id)
+    sync_locks.add(lock_key)
+    with pytest.raises(connections.PluginConnectionError, match="syncing right now"):
+        await connections.finish_oauth(
+            session, workspace_id=workspace_id, user_id=user_id, code=None, state=state_busy, params={}
+        )
+    sync_locks.discard(lock_key)
+
+    # Rotate an extra secret in DB before finish_oauth; oauth_exchange keeps it when merging.
+    _, state_ok = await connections.start_oauth(session, connection, user_id=user_id)
+    rotated_extra = vault.seal({**vault.unseal(connection.secrets), "rotated_key": "fresh-3"})
+    await session.execute(
+        update(PluginConnection)
+        .where(PluginConnection.id == connection.id)
+        .values(secrets=rotated_extra)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+
+    finished = await connections.finish_oauth(
+        session, workspace_id=workspace_id, user_id=user_id, code=None, state=state_ok, params={}
+    )
+    unsealed_after = vault.unseal(finished.secrets)
+    assert unsealed_after["rotated_key"] == "fresh-3"
+    assert unsealed_after["refresh_token"] == "rot-1"
+    assert "pending_link_token" not in unsealed_after

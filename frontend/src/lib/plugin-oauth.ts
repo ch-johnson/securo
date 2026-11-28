@@ -5,12 +5,13 @@
  */
 const PLUGIN_OAUTH_STATE_KEY = 'securo:pluginOAuthState'
 
-export function rememberPluginOAuthState(state: string | null | undefined): void {
+export function rememberPluginOAuthState(state: string | null | undefined): boolean {
   try {
     if (state) sessionStorage.setItem(PLUGIN_OAUTH_STATE_KEY, state)
     else sessionStorage.removeItem(PLUGIN_OAUTH_STATE_KEY)
+    return true
   } catch {
-    // Storage may be unavailable in restricted contexts; URL state still works.
+    return false
   }
 }
 

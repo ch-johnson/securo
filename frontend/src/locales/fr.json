@@ -4057,7 +4057,8 @@
       "connected": "{{name}} connectée",
       "failed": "Impossible de finaliser la connexion. Réessayez.",
       "missing": "Le service n'a pas renvoyé la connexion. Réessayez.",
-      "serviceError": "Le service a signalé une erreur : {{message}}"
+      "serviceError": "Le service a signalé une erreur : {{message}}",
+      "storageFailed": "Impossible d'enregistrer l'état de connexion dans ce navigateur. Activez le stockage du navigateur et réessayez."
     },
     "onlyForBusiness": "Espaces de travail professionnels uniquement",
     "onlyForPersonal": "Espaces de travail personnels uniquement"

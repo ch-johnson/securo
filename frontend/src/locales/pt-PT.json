@@ -4056,7 +4056,8 @@
       "connected": "{{name}} ligada",
       "failed": "Não foi possível concluir o início de sessão. Tente novamente.",
       "missing": "O serviço não devolveu o início de sessão. Tente novamente.",
-      "serviceError": "O serviço indicou um erro: {{message}}"
+      "serviceError": "O serviço indicou um erro: {{message}}",
+      "storageFailed": "Não foi possível guardar o estado de início de sessão neste navegador. Ative o armazenamento do navegador e tente novamente."
     },
     "onlyForBusiness": "Só espaços de trabalho de negócios",
     "onlyForPersonal": "Só espaços de trabalho pessoais"

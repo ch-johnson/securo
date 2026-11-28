@@ -4057,7 +4057,8 @@
       "connected": "{{name}} conectada",
       "failed": "No se pudo terminar el inicio de sesión. Inténtalo de nuevo.",
       "missing": "El servicio no devolvió el inicio de sesión. Inténtalo de nuevo.",
-      "serviceError": "El servicio informó un error: {{message}}"
+      "serviceError": "El servicio informó un error: {{message}}",
+      "storageFailed": "No se pudo guardar el estado de inicio de sesión en este navegador. Habilita el almacenamiento del navegador e inténtalo de nuevo."
     },
     "onlyForBusiness": "Solo espacios de trabajo de negocios",
     "onlyForPersonal": "Solo espacios de trabajo personales"

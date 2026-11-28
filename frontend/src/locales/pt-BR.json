@@ -4057,7 +4057,8 @@
       "connected": "{{name}} conectada",
       "failed": "Não foi possível concluir o login. Tente de novo.",
       "missing": "O serviço não devolveu o login. Tente de novo.",
-      "serviceError": "O serviço informou um erro: {{message}}"
+      "serviceError": "O serviço informou um erro: {{message}}",
+      "storageFailed": "Não foi possível salvar o estado de login neste navegador. Ative o armazenamento do navegador e tente novamente."
     },
     "onlyForBusiness": "Só workspaces de negócios",
     "onlyForPersonal": "Só workspaces pessoais"

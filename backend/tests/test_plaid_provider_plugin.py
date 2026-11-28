@@ -1115,10 +1115,10 @@ def test_plaid_sync_edge_cases_not_ready_unsupported_loan_txns_cursor_guard_and_
                     },
                     {
                         "account_id": "acc-m1",
-                        "name": "M1 Crypto & Stock",
+                        "name": "M1 Crypto",
                         "type": "brokerage",
                         "subtype": "brokerage",
-                        "balances": {"current": 3000.0, "iso_currency_code": "USD"},
+                        "balances": {"current": 3000.0, "unofficial_currency_code": "BTC"},
                     },
                 ],
             }
@@ -1695,3 +1695,157 @@ async def test_plaid_omitted_incomplete_holdings_retains_assets_and_cash_balance
     assert accounts_empty["acc-m1"].balance == Decimal("2750.00")
     (vti_archived,) = await _rows(session, Asset, connection_id=bank_id)
     assert vti_archived.is_archived is True
+
+
+@pytest.mark.asyncio
+async def test_plaid_null_current_balance_and_cross_currency_holdings_prevent_double_counting(
+    session: AsyncSession, ids, plaid_catalog, plugin_runner, states, monkeypatch
+):
+    """Two Plaid investment balance safeguards:
+    1. When `balances.current` is null and `available` is cash-only (250), Plaid
+       must NOT send `auto_invested_balance` (neither on complete nor omitted
+       holdings snapshots), so stored cash stays 250 instead of -2250 or 0.
+    2. When an investment account in CAD (1400 CAD gross) holds a USD stock
+       (1000 USD), Plaid treats the snapshot as incomplete (omits `holdings` and
+       caps `auto_invested_balance` at `current`), preventing double counting."""
+    mod = _module()
+
+    def _ctx():
+        return type(
+            "Context",
+            (),
+            {
+                "secrets": MappingProxyType({"secret": "sec-1", "access_token": "acc-1"}),
+                "config": MappingProxyType({"client_id": "cid-1", "environment": "sandbox"}),
+                "securo": MappingProxyType({}),
+            },
+        )()
+
+    # 1a. current=None, available=250 with complete holdings -> NO auto_invested_balance.
+    def null_current_complete(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if url.endswith("/accounts/get"):
+            return {
+                "item": {},
+                "accounts": [
+                    {
+                        "account_id": "acc-avail",
+                        "name": "Available Only Brokerage",
+                        "type": "investment",
+                        "subtype": "brokerage",
+                        "balances": {"current": None, "available": 250.0, "iso_currency_code": "USD"},
+                    }
+                ],
+            }
+        if url.endswith("/investments/holdings/get"):
+            return {
+                "securities": [{"security_id": "sec-vti", "name": "VTI", "ticker_symbol": "VTI", "type": "etf"}],
+                "holdings": [
+                    {
+                        "account_id": "acc-avail",
+                        "security_id": "sec-vti",
+                        "quantity": 10,
+                        "institution_value": 2500.0,
+                        "iso_currency_code": "USD",
+                    }
+                ],
+            }
+        if url.endswith("/investments/transactions/get"):
+            return {"investment_transactions": [], "total_investment_transactions": 0}
+        raise AssertionError(url)
+
+    res_avail = mod.PlaidPlugin(requester=null_current_complete).sync({"state": {}}, _ctx())
+    assert res_avail["data"]["accounts"][0]["balance"] == "250.00"
+    assert "auto_invested_balance" not in res_avail["data"]["accounts"][0]
+    assert len(res_avail["data"]["holdings"]) == 1
+
+    # 1b. current=None, available=250 with omitted holdings -> STILL NO auto_invested_balance.
+    def null_current_omitted(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if url.endswith("/investments/holdings/get"):
+            return {
+                "securities": [{"security_id": "sec-vti", "name": "VTI", "ticker_symbol": "VTI", "type": "etf"}],
+                "holdings": [
+                    {
+                        "account_id": "acc-avail",
+                        "security_id": "sec-vti",
+                        "quantity": 10,
+                        "institution_value": None,
+                        "iso_currency_code": "USD",
+                    }
+                ],
+            }
+        return null_current_complete(url, payload)
+
+    res_avail_omitted = mod.PlaidPlugin(requester=null_current_omitted).sync({"state": {}}, _ctx())
+    assert "holdings" not in res_avail_omitted["data"]
+    assert res_avail_omitted["data"]["accounts"][0]["balance"] == "250.00"
+    assert "auto_invested_balance" not in res_avail_omitted["data"]["accounts"][0]
+
+    # 2. CAD brokerage account holding USD stock -> treated as incomplete snapshot
+    #    end-to-end so gross CAD balance is stored without double-counting USD asset.
+    class _CrossCurrencyAndNullCurrentPlaid(FakePlaidServer):
+        def __call__(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+            if url.endswith("/accounts/get"):
+                return {
+                    "item": {"item_id": "item-1", "institution_id": "ins_1"},
+                    "accounts": [
+                        {
+                            "account_id": "acc-cad",
+                            "name": "CAD Brokerage",
+                            "type": "investment",
+                            "subtype": "brokerage",
+                            "balances": {"current": 1400.0, "available": None, "iso_currency_code": "CAD"},
+                        },
+                        {
+                            "account_id": "acc-avail",
+                            "name": "Cash-Only Avail Brokerage",
+                            "type": "investment",
+                            "subtype": "brokerage",
+                            "balances": {"current": None, "available": 250.0, "iso_currency_code": "USD"},
+                        },
+                    ],
+                }
+            if url.endswith("/investments/holdings/get"):
+                return {
+                    "securities": [
+                        {"security_id": "sec-vti", "name": "VTI", "ticker_symbol": "VTI", "type": "etf"}
+                    ],
+                    "holdings": [
+                        {
+                            "account_id": "acc-cad",
+                            "security_id": "sec-vti",
+                            "quantity": 4,
+                            "institution_value": 1000.0,
+                            "iso_currency_code": "USD",
+                        }
+                    ],
+                }
+            if url.endswith("/investments/transactions/get"):
+                return {"investment_transactions": [], "total_investment_transactions": 0}
+            return super().__call__(url, payload)
+
+    fake = _CrossCurrencyAndNullCurrentPlaid(mod)
+    _wire_fake_plaid(monkeypatch, fake)
+
+    workspace_id, user_id = ids
+    await _apply(session, workspace_id, user_id)
+    connection, _, state = await connections.create_with_oauth(
+        session,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        can_write=True,
+        plugin_id=PLUGIN,
+        integration_key="plaid",
+        name="Plaid Multi-CCY",
+        values={"client_id": "cid-1", "secret": "sec-secret-99", "environment": "sandbox"},
+        lang="en",
+    )
+    assert state is not None
+    await connections.finish_oauth(
+        session, workspace_id=workspace_id, user_id=user_id, code=None, state=state, params={"status": "success"}
+    )
+    await connections.sync(session, connection)
+    bank = await _bank(session, connection)
+    accts = {a.external_id: a for a in await _rows(session, Account, connection_id=bank.id)}
+    assert accts["acc-cad"].balance == Decimal("1400.00")
+    assert accts["acc-avail"].balance == Decimal("250.00")
+    assert await _rows(session, Asset, connection_id=bank.id) == []

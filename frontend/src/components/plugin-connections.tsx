@@ -100,7 +100,11 @@ export function PluginConnections({ plugin }: { plugin: InstalledPlugin }) {
   const authorizeMutation = useMutation({
     mutationFn: pluginsApi.authorize,
     onSuccess: ({ authorize_url, oauth_state }) => {
-      rememberPluginOAuthState(oauth_state)
+      if (oauth_state && !rememberPluginOAuthState(oauth_state)) {
+        toast.error(t('plugins.oauth.storageFailed'))
+        return
+      }
+      if (!oauth_state) rememberPluginOAuthState(null)
       window.location.assign(authorize_url)
     },
     onError: (err) => toast.error(errorMessage(err, t('common.error'))),
@@ -318,7 +322,11 @@ export function PluginConnectionDialog({
     onSuccess: ({ connection: saved, authorize_url, oauth_state }) => {
       onDone(saved)
       if (authorize_url) {
-        rememberPluginOAuthState(oauth_state)
+        if (oauth_state && !rememberPluginOAuthState(oauth_state)) {
+          toast.error(t('plugins.oauth.storageFailed'))
+          return
+        }
+        if (!oauth_state) rememberPluginOAuthState(null)
         window.location.assign(authorize_url)
         return
       }

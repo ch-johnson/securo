@@ -4057,7 +4057,8 @@
       "connected": "{{name}} connessa",
       "failed": "Impossibile completare l'accesso. Riprova.",
       "missing": "Il servizio non ha restituito l'accesso. Riprova.",
-      "serviceError": "Il servizio ha segnalato un errore: {{message}}"
+      "serviceError": "Il servizio ha segnalato un errore: {{message}}",
+      "storageFailed": "Impossibile salvare lo stato di accesso in questo browser. Abilita la memoria del browser e riprova."
     },
     "onlyForBusiness": "Solo aree di lavoro per attività",
     "onlyForPersonal": "Solo aree di lavoro personali"

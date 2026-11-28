@@ -20,7 +20,13 @@ const api = vi.hoisted(() => ({
   },
 }))
 
+const toast = vi.hoisted(() => ({
+  success: vi.fn(),
+  error: vi.fn(),
+}))
+
 vi.mock('@/lib/api', () => api)
+vi.mock('sonner', () => ({ toast }))
 
 const auth = vi.hoisted(() => ({ user: { theme: null as string | null }, updateUser: vi.fn() }))
 vi.mock('@/contexts/auth-context', () => ({ useAuth: () => auth }))
@@ -94,6 +100,8 @@ function workspace(canManage: boolean, canWrite = true) {
 
 beforeEach(() => {
   Object.values(api.plugins).forEach((fn) => fn.mockReset())
+  toast.success.mockReset()
+  toast.error.mockReset()
 })
 
 describe('PluginPlanDialog with code', () => {
@@ -464,6 +472,63 @@ describe('PluginConnections: files and routines', () => {
       expect(sessionStorage.getItem('securo:pluginOAuthState')).toBe('state-from-connect')
     } finally {
       sessionStorage.removeItem('securo:pluginOAuthState')
+      Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
+    }
+  })
+
+  it('shows an error and skips redirecting when sessionStorage fails to store oauth_state', async () => {
+    const oauthPlugin: InstalledPlugin = {
+      ...PLUGIN,
+      integrations: [
+        {
+          key: 'plaid',
+          name: { en: 'Plaid' },
+          auth: 'oauth',
+          fields: [{ key: 'client_id', label: { en: 'Client ID' }, secret: false, required: true }],
+          sync_minutes: 360,
+          provides: ['accounts', 'transactions'],
+        },
+      ],
+    }
+    const assign = vi.fn()
+    const originalLocation = window.location
+    Object.defineProperty(window, 'location', {
+      configurable: true,
+      value: { ...originalLocation, assign },
+    })
+    const setItemSpy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('Storage disabled', 'SecurityError')
+    })
+    try {
+      api.plugins.connections.mockResolvedValue([
+        { ...CONNECTION, id: 'c-plaid', integration: 'plaid', status: 'needs_auth' },
+      ])
+      api.plugins.authorize.mockResolvedValue({
+        authorize_url: 'https://hosted.plaid.com/link/reauth-1',
+        oauth_state: 'state-from-authorize',
+      })
+      const { user } = renderWithProviders(
+        <WorkspaceContext.Provider value={workspace(true)}>
+          <PluginConnections plugin={oauthPlugin} />
+        </WorkspaceContext.Provider>,
+      )
+      await user.click(await screen.findByRole('button', { name: t('plugins.connections.signIn') }))
+      await waitFor(() => expect(toast.error).toHaveBeenCalledWith(t('plugins.oauth.storageFailed')))
+      expect(assign).not.toHaveBeenCalled()
+
+      toast.error.mockReset()
+      api.plugins.connect.mockResolvedValue({
+        connection: { ...CONNECTION, id: 'c-plaid-2', integration: 'plaid', status: 'needs_auth' },
+        authorize_url: 'https://hosted.plaid.com/link/create-1',
+        oauth_state: 'state-from-create',
+      })
+      await user.click(screen.getByRole('button', { name: t('plugins.connections.add') }))
+      await user.type(screen.getByLabelText('Client ID'), 'cid-2')
+      await user.click(screen.getByRole('button', { name: t('plugins.connections.continueSignIn') }))
+      await waitFor(() => expect(toast.error).toHaveBeenCalledWith(t('plugins.oauth.storageFailed')))
+      expect(assign).not.toHaveBeenCalled()
+    } finally {
+      setItemSpy.mockRestore()
       Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
     }
   })
